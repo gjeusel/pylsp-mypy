@@ -13,11 +13,10 @@ import logging
 import os
 import os.path
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import IO, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import toml
 from mypy import api as mypy_api
@@ -30,9 +29,7 @@ line_pattern: str = r"((?:^[a-z]:)?[^:]+):(?:(\d+):)?(?:(\d+):)? (\w+): (.*)"
 log = logging.getLogger(__name__)
 
 # A mapping from workspace path to config file path
-mypyConfigFileMap: Dict[str, Optional[str]] = {}
-
-tmpFile: Optional[IO[str]] = None
+mypy_config_file_map: Dict[str, Optional[str]] = {}
 
 # In non-live-mode the file contents aren't updated.
 # Returning an empty diagnostic clears the diagnostic result,
@@ -46,8 +43,52 @@ last_diagnostics: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list
 # This flag is new in python 3.7
 # THis flag only exists on Windows
 windows_flag: Dict[str, int] = (
-    {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}  # type: ignore
+    # type: ignore
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if os.name == "nt"
+    else {}
 )
+
+DMYPY_TMP_DIR = Path(tempfile.gettempdir())
+dmypy_status_file = DMYPY_TMP_DIR / "dmypy.json"
+dmypy_perf_file = DMYPY_TMP_DIR / "dmypy-perf.json"
+
+
+_runtime_filepaths: dict[str, Any] = {
+    # "live_mode_buffer": None,
+    # "dmypy_status_file": None,
+    # "dmypy_perf_file": None,
+}
+
+
+def get_runtime_filepaths() -> dict[str, Any]:
+    global _runtime_filepaths
+    tmpdir = Path(tempfile.gettempdir())
+    if not _runtime_filepaths:
+        _runtime_filepaths = {
+            "live_mode_buffer": tmpdir / "live-mode-buffer.txt",
+            "dmypy_status_file": tmpdir / "dmypy.json",
+            "dmypy_perf_file": tmpdir / "dmypy-perf.json",
+        }
+
+    return _runtime_filepaths
+
+
+def format_diagnostics_log_report(diagnostics: list[Any]) -> str:
+    map_diag_severity = collections.defaultdict(list)
+    for diag in diagnostics:
+        map_diag_severity[str(diag["severity"])].append(diag)
+
+    log_msg_details = []
+    for key, label in {"1": "error", "2": "warning", "3": "info"}.items():
+        if key in map_diag_severity:
+            log_msg_details.append(f"{label}: {len(map_diag_severity[key])}")
+
+    msg = f'total: {len(diagnostics)}'
+    if log_msg_details:
+        msg = f'{msg} - ({" ".join(log_msg_details)})'
+
+    return msg
 
 
 def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[str, Any]]:
@@ -75,10 +116,11 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[
         file_path, linenoStr, offsetStr, severity, msg = result.groups()
 
         if file_path != "<string>":  # live mode
-            # results from other files can be included, but we cannot return
-            # them.
+            # results from other files can be included, but we cannot return them.
             if document and document.path and not document.path.endswith(file_path):
-                log.warning("discarding result for %s against %s", file_path, document.path)
+                log.debug(
+                    f"diagnostics - discarding result for {file_path} against {document.path}"
+                )
                 return None
 
         lineno = int(linenoStr or 1) - 1  # 0-based line number
@@ -159,12 +201,7 @@ def pylsp_lint(
         if settings == {}:
             settings = oldSettings2
 
-    log.info(
-        "lint settings = %s document.path = %s is_saved = %s",
-        settings,
-        document.path,
-        is_saved,
-    )
+    log.info(f"lint cfg - {settings=} {document.path=} {is_saved=}")
 
     live_mode = settings.get("live_mode", True)
     dmypy = settings.get("dmypy", False)
@@ -172,34 +209,30 @@ def pylsp_lint(
     if dmypy and live_mode:
         # dmypy can only be efficiently run on files that have been saved, see:
         # https://github.com/python/mypy/issues/9309
-        log.warning("live_mode is not supported with dmypy, disabling")
+        log.warning("cfg - live_mode is not supported with dmypy, disabling")
         live_mode = False
 
     args = ["--show-column-numbers"]
 
-    global tmpFile
+    runtime_filepaths = get_runtime_filepaths()
+
     if live_mode and not is_saved:
-        if tmpFile:
-            tmpFile = open(tmpFile.name, "w")
-        else:
-            tmpFile = tempfile.NamedTemporaryFile("w", delete=False)
-        log.info("live_mode tmpFile = %s", tmpFile.name)
-        tmpFile.write(document.source)
-        tmpFile.close()
-        args.extend(["--shadow-file", document.path, tmpFile.name])
+        live_mode_buffer_file = open(runtime_filepaths["live_mode_buffer"], "w")
+        log.info(f"cfg - live_mode {live_mode_buffer_file=}")
+        live_mode_buffer_file.write(document.source)
+        live_mode_buffer_file.close()
+        args.extend(["--shadow-file", document.path, live_mode_buffer_file.name])
     elif not is_saved and document.path in last_diagnostics:
         # On-launch the document isn't marked as saved, so fall through and run
         # the diagnostics anyway even if the file contents may be out of date.
-        log.info(
-            "non-live, returning cached diagnostics len(cached) = %s",
-            last_diagnostics[document.path],
-        )
+        n_diagnostics = len(last_diagnostics[document.path])
+        log.info(f"cache - returning cached diagnostics {n_diagnostics=}")
         return last_diagnostics[document.path]
 
-    mypyConfigFile = mypyConfigFileMap.get(workspace.root_path)
-    if mypyConfigFile:
+    mypy_cfg_file = mypy_config_file_map.get(workspace.root_path)
+    if mypy_cfg_file:
         args.append("--config-file")
-        args.append(mypyConfigFile)
+        args.append(mypy_cfg_file)
 
     args.append(document.path)
 
@@ -207,27 +240,13 @@ def pylsp_lint(
         args.append("--strict")
 
     overrides = settings.get("overrides", [True])
-    exit_status = 0
+    status = 0
 
     if not dmypy:
         args.extend(["--incremental", "--follow-imports", "silent"])
         args = apply_overrides(args, overrides)
-
-        if shutil.which("mypy"):
-            # mypy exists on path
-            # -> use mypy on path
-            log.info("executing mypy args = %s on path", args)
-            completed_process = subprocess.run(
-                ["mypy", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **windows_flag
-            )
-            report = completed_process.stdout.decode()
-            errors = completed_process.stderr.decode()
-            exit_status = completed_process.returncode
-        else:
-            # mypy does not exist on path, but must exist in the env pylsp-mypy is installed in
-            # -> use mypy via api
-            log.info("executing mypy args = %s via api", args)
-            report, errors, exit_status = mypy_api.run(args)
+        log.info(f"mypy - {args=}")
+        report, messages, status = mypy_api.run(args)
     else:
         # If dmypy daemon is non-responsive calls to run will block.
         # Check daemon status, if non-zero daemon is dead or hung.
@@ -235,59 +254,32 @@ def pylsp_lint(
         # If daemon is dead/absent, kill will no-op.
         # In either case, reset to fresh state
 
-        if shutil.which("dmypy"):
-            # dmypy exists on path
-            # -> use mypy on path
-            completed_process = subprocess.run(
-                ["dmypy", *apply_overrides(args, overrides)], stderr=subprocess.PIPE, **windows_flag
-            )
-            errors = completed_process.stderr.decode()
-            exit_status = completed_process.returncode
-            if exit_status != 0:
-                log.info(
-                    "restarting dmypy from status: %s message: %s via path",
-                    exit_status,
-                    errors.strip(),
-                )
-                subprocess.run(["dmypy", "kill"], **windows_flag)
-        else:
-            # dmypy does not exist on path, but must exist in the env pylsp-mypy is installed in
-            # -> use dmypy via api
-            _, errors, exit_status = mypy_api.run_dmypy(["status"])
-            if exit_status != 0:
-                log.info(
-                    "restarting dmypy from status: %s message: %s via api",
-                    exit_status,
-                    errors.strip(),
-                )
-                mypy_api.run_dmypy(["kill"])
+        _, messages, status = mypy_api.run_dmypy(["status"])
+        if status != 0:
+            log.info(f"dmypy status - {status=} ({messages=})")
+            mypy_api.run_dmypy(["kill"])
 
         # run to use existing daemon or restart if required
-        args = ["run", "--"] + apply_overrides(args, overrides)
+        dmypy_args = ["--status-file", runtime_filepaths["dmypy_status_file"].as_posix()]
+        dmypy_subcommand_args = [
+            "--perf-stats-file",
+            runtime_filepaths["dmypy_perf_file"].as_posix(),
+        ]
 
-        if shutil.which("dmypy"):
-            # dmypy exists on path
-            # -> use mypy on path
-            log.info("dmypy run args = %s via path", args)
-            completed_process = subprocess.run(
-                ["dmypy", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **windows_flag
-            )
-            report = completed_process.stdout.decode()
-            errors = completed_process.stderr.decode()
-            exit_status = completed_process.returncode
-        else:
-            # dmypy does not exist on path, but must exist in the env pylsp-mypy is installed in
-            # -> use dmypy via api
-            log.info("dmypy run args = %s via api", args)
-            report, errors, exit_status = mypy_api.run_dmypy(args)
+        args = [*dmypy_args, "run", *dmypy_subcommand_args, "--"] + apply_overrides(
+            args, overrides
+        )
 
-    log.debug("report:\n%s", report)
-    log.debug("errors:\n%s", errors)
+        log.info(f"dmypy - running 'dmypy {' '.join(args)}'")
+        report, messages, status = mypy_api.run_dmypy(args)
+
+    log.debug(f"report:\n{report}")
+    log.debug(f"errors:\n{messages}")
 
     diagnostics = []
 
     # Expose generic mypy error on the first line.
-    if errors:
+    if messages:
         diagnostics.append(
             {
                 "source": "mypy",
@@ -296,18 +288,19 @@ def pylsp_lint(
                     # Client is supposed to clip end column to line length.
                     "end": {"line": 0, "character": 1000},
                 },
-                "message": errors,
-                "severity": 1 if exit_status != 0 else 2,  # Error if exited with error or warning.
+                "message": messages,
+                # Error if exited with error or warning.
+                "severity": 1 if status != 0 else 2,
             }
         )
 
     for line in report.splitlines():
-        log.debug("parsing: line = %r", line)
+        log.debug(f"parsing - {line=}")
         diag = parse_line(line, document)
         if diag:
             diagnostics.append(diag)
 
-    log.info("pylsp-mypy len(diagnostics) = %s", len(diagnostics))
+    log.info(f"diagnostics - {format_diagnostics_log_report(diagnostics)}")
 
     last_diagnostics[document.path] = diagnostics
     return diagnostics
@@ -348,10 +341,10 @@ def init(workspace: str) -> Dict[str, str]:
         The plugin config dict.
 
     """
-    log.info("init workspace = %s", workspace)
+    log.info(f"init workspace - {workspace}")
 
     configuration = {}
-    path = findConfigFile(
+    path = find_config_file(
         workspace, ["pylsp-mypy.cfg", "mypy-ls.cfg", "mypy_ls.cfg", "pyproject.toml"]
     )
     if path:
@@ -361,14 +354,14 @@ def init(workspace: str) -> Dict[str, str]:
             with open(path) as file:
                 configuration = ast.literal_eval(file.read())
 
-    mypyConfigFile = findConfigFile(workspace, ["mypy.ini", ".mypy.ini", "pyproject.toml"])
-    mypyConfigFileMap[workspace] = mypyConfigFile
+    mypy_config_file = find_config_file(workspace, ["mypy.ini", ".mypy.ini", "pyproject.toml"])
+    mypy_config_file_map[workspace] = mypy_config_file
 
-    log.info("mypyConfigFile = %s configuration = %s", mypyConfigFile, configuration)
+    log.info(f"mypy cfg - {mypy_config_file=} {configuration=}")
     return configuration
 
 
-def findConfigFile(path: str, names: List[str]) -> Optional[str]:
+def find_config_file(path: str, names: List[str]) -> Optional[str]:
     """
     Search for a config file.
 
@@ -423,5 +416,6 @@ def close() -> None:
     None.
 
     """
-    if tmpFile and tmpFile.name:
-        os.unlink(tmpFile.name)
+    for runtime_fpath in _runtime_filepaths.values():
+        if runtime_fpath:
+            os.unlink(runtime_fpath)
