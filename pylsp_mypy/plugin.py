@@ -84,7 +84,7 @@ def format_diagnostics_log_report(diagnostics: list[Any]) -> str:
         if key in map_diag_severity:
             log_msg_details.append(f"{label}: {len(map_diag_severity[key])}")
 
-    msg = f'total: {len(diagnostics)}'
+    msg = f"total: {len(diagnostics)}"
     if log_msg_details:
         msg = f'{msg} - ({" ".join(log_msg_details)})'
 
@@ -266,9 +266,7 @@ def pylsp_lint(
             runtime_filepaths["dmypy_perf_file"].as_posix(),
         ]
 
-        args = [*dmypy_args, "run", *dmypy_subcommand_args, "--"] + apply_overrides(
-            args, overrides
-        )
+        args = [*dmypy_args, "run", *dmypy_subcommand_args, "--"] + apply_overrides(args, overrides)
 
         log.info(f"dmypy - running 'dmypy {' '.join(args)}'")
         report, messages, status = mypy_api.run_dmypy(args)
