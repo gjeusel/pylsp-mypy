@@ -14,9 +14,8 @@ import os
 import os.path
 import re
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import toml
 from mypy import api as mypy_api
@@ -29,29 +28,22 @@ line_pattern: str = r"((?:^[a-z]:)?[^:]+):(?:(\d+):)?(?:(\d+):)? (\w+): (.*)"
 log = logging.getLogger(__name__)
 
 # A mapping from workspace path to config file path
-mypy_config_file_map: Dict[str, Optional[str]] = {}
+mypy_config_file_map: dict[str, Optional[str]] = {}
 
 # In non-live-mode the file contents aren't updated.
 # Returning an empty diagnostic clears the diagnostic result,
 # so store a cache of last diagnostics for each file a-la the pylint plugin,
 # so we can return some potentially-stale diagnostics.
 # https://github.com/python-lsp/python-lsp-server/blob/v1.0.1/pylsp/plugins/pylint_lint.py#L55-L62
-last_diagnostics: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+last_diagnostics: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
 
 # Windows started opening opening a cmd-like window for every subprocess call
 # This flag prevents that.
 # This flag is new in python 3.7
 # THis flag only exists on Windows
-windows_flag: Dict[str, int] = (
-    # type: ignore
-    {"creationflags": subprocess.CREATE_NO_WINDOW}
-    if os.name == "nt"
-    else {}
+windows_flag: dict[str, int] = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 )
-
-DMYPY_TMP_DIR = Path(tempfile.gettempdir())
-dmypy_status_file = DMYPY_TMP_DIR / "dmypy.json"
-dmypy_perf_file = DMYPY_TMP_DIR / "dmypy-perf.json"
 
 
 _runtime_filepaths: dict[str, Any] = {
@@ -61,9 +53,13 @@ _runtime_filepaths: dict[str, Any] = {
 }
 
 
-def get_runtime_filepaths() -> dict[str, Any]:
+def get_runtime_filepaths(workspace: Workspace) -> dict[str, Any]:
+    workspace_name = workspace._root_uri.split("/")[-1]
+    tmpdir = Path(f"/tmp/{workspace_name}")
+    if not tmpdir.exists():
+        tmpdir.mkdir()
+
     global _runtime_filepaths
-    tmpdir = Path(tempfile.gettempdir())
     if not _runtime_filepaths:
         _runtime_filepaths = {
             "live_mode_buffer": tmpdir / "live-mode-buffer.txt",
@@ -91,7 +87,7 @@ def format_diagnostics_log_report(diagnostics: list[Any]) -> str:
     return msg
 
 
-def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[str, Any]]:
+def parse_line(line: str, document: Optional[Document] = None) -> Optional[dict[str, Any]]:
     """
     Return a language-server diagnostic from a line of the Mypy error report.
 
@@ -107,7 +103,7 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[
 
     Returns
     -------
-    Optional[Dict[str, Any]]
+    Optional[dict[str, Any]]
         The dict with the lint data.
 
     """
@@ -128,7 +124,7 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[
         errno = 2
         if severity == "error":
             errno = 1
-        diag: Dict[str, Any] = {
+        diag: dict[str, Any] = {
             "source": "mypy",
             "range": {
                 "start": {"line": lineno, "character": offset},
@@ -149,7 +145,7 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[
     return None
 
 
-def apply_overrides(args: List[str], overrides: List[Any]) -> List[str]:
+def apply_overrides(args: list[str], overrides: list[Any]) -> list[str]:
     """Replace or combine default command-line options with overrides."""
     overrides_iterator = iter(overrides)
     if True not in overrides_iterator:
@@ -164,7 +160,7 @@ def apply_overrides(args: List[str], overrides: List[Any]) -> List[str]:
 @hookimpl
 def pylsp_lint(
     config: Config, workspace: Workspace, document: Document, is_saved: bool
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Lints.
 
@@ -181,8 +177,8 @@ def pylsp_lint(
 
     Returns
     -------
-    List[Dict[str, Any]]
-        List of the linting data.
+    list[dict[str, Any]]
+        list of the linting data.
 
     """
     settings = config.plugin_settings("pylsp_mypy")
@@ -206,6 +202,9 @@ def pylsp_lint(
     live_mode = settings.get("live_mode", True)
     dmypy = settings.get("dmypy", False)
 
+    # progress_ctx = workspace.report_progress("dmypy" if dmypy else "mypy")
+    # progress_ctx.__enter__()
+
     if dmypy and live_mode:
         # dmypy can only be efficiently run on files that have been saved, see:
         # https://github.com/python/mypy/issues/9309
@@ -214,7 +213,7 @@ def pylsp_lint(
 
     args = ["--show-column-numbers"]
 
-    runtime_filepaths = get_runtime_filepaths()
+    runtime_filepaths = get_runtime_filepaths(workspace=workspace)
 
     if live_mode and not is_saved:
         live_mode_buffer_file = open(runtime_filepaths["live_mode_buffer"], "w")
@@ -305,7 +304,7 @@ def pylsp_lint(
 
 
 @hookimpl
-def pylsp_settings(config: Config) -> Dict[str, Dict[str, Dict[str, str]]]:
+def pylsp_settings(config: Config) -> dict[str, dict[str, dict[str, str]]]:
     """
     Read the settings.
 
@@ -316,7 +315,7 @@ def pylsp_settings(config: Config) -> Dict[str, Dict[str, Dict[str, str]]]:
 
     Returns
     -------
-    Dict[str, Dict[str, Dict[str, str]]]
+    dict[str, dict[str, dict[str, str]]]
         The config dict.
 
     """
@@ -324,7 +323,7 @@ def pylsp_settings(config: Config) -> Dict[str, Dict[str, Dict[str, str]]]:
     return {"plugins": {"pylsp_mypy": configuration}}
 
 
-def init(workspace: str) -> Dict[str, str]:
+def init(workspace: str) -> dict[str, str]:
     """
     Find plugin and mypy config files and creates the temp file should it be used.
 
@@ -335,7 +334,7 @@ def init(workspace: str) -> Dict[str, str]:
 
     Returns
     -------
-    Dict[str, str]
+    dict[str, str]
         The plugin config dict.
 
     """
@@ -359,7 +358,7 @@ def init(workspace: str) -> Dict[str, str]:
     return configuration
 
 
-def find_config_file(path: str, names: List[str]) -> Optional[str]:
+def find_config_file(path: str, names: list[str]) -> Optional[str]:
     """
     Search for a config file.
 
@@ -370,7 +369,7 @@ def find_config_file(path: str, names: List[str]) -> Optional[str]:
     ----------
     path : str
         The path where the search starts.
-    names : List[str]
+    names : list[str]
         The file to be found (or alternative names).
 
     Returns
