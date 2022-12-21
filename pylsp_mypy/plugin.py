@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import toml
 from mypy import api as mypy_api
+from mypy.version import __version__ as __mypy_version__
 from pylsp import hookimpl
 from pylsp.config.config import Config
 from pylsp.workspace import Document, Workspace
@@ -50,6 +51,7 @@ _runtime_filepaths: dict[str, Any] = {
     # "live_mode_buffer": None,
     # "dmypy_status_file": None,
     # "dmypy_perf_file": None,
+    # "dmypy_logfile": None,
 }
 
 
@@ -65,6 +67,7 @@ def get_runtime_filepaths(workspace: Workspace) -> dict[str, Any]:
             "live_mode_buffer": tmpdir / "live-mode-buffer.txt",
             "dmypy_status_file": tmpdir / "dmypy.json",
             "dmypy_perf_file": tmpdir / "dmypy-perf.json",
+            "dmypy_logfile": tmpdir / "dmypy.log",
         }
 
     return _runtime_filepaths
@@ -87,7 +90,9 @@ def format_diagnostics_log_report(diagnostics: list[Any]) -> str:
     return msg
 
 
-def parse_line(line: str, document: Optional[Document] = None) -> Optional[dict[str, Any]]:
+def parse_line(
+    line: str, document: Optional[Document] = None
+) -> Optional[dict[str, Any]]:
     """
     Return a language-server diagnostic from a line of the Mypy error report.
 
@@ -139,7 +144,9 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[dict[
             # can make a good guess by highlighting the word that Mypy flagged
             word = document.word_at_position(diag["range"]["start"])
             if word:
-                diag["range"]["end"]["character"] = diag["range"]["start"]["character"] + len(word)
+                diag["range"]["end"]["character"] = diag["range"]["start"][
+                    "character"
+                ] + len(word)
 
         return diag
     return None
@@ -182,28 +189,10 @@ def pylsp_lint(
 
     """
     settings = config.plugin_settings("pylsp_mypy")
-    oldSettings1 = config.plugin_settings("mypy-ls")
-    if oldSettings1 != {}:
-        raise DeprecationWarning(
-            "Your configuration uses the namespace mypy-ls, this should be changed to pylsp_mypy"
-        )
-    oldSettings2 = config.plugin_settings("mypy_ls")
-    if oldSettings2 != {}:
-        raise DeprecationWarning(
-            "Your configuration uses the namespace mypy_ls, this should be changed to pylsp_mypy"
-        )
-    if settings == {}:
-        settings = oldSettings1
-        if settings == {}:
-            settings = oldSettings2
-
-    log.info(f"lint cfg - {settings=} {document.path=} {is_saved=}")
+    log.debug(f"lint cfg - {settings=} {document.path=} {is_saved=}")
 
     live_mode = settings.get("live_mode", True)
     dmypy = settings.get("dmypy", False)
-
-    # progress_ctx = workspace.report_progress("dmypy" if dmypy else "mypy")
-    # progress_ctx.__enter__()
 
     if dmypy and live_mode:
         # dmypy can only be efficiently run on files that have been saved, see:
@@ -242,7 +231,8 @@ def pylsp_lint(
     status = 0
 
     if not dmypy:
-        args.extend(["--incremental", "--follow-imports", "silent"])
+        # args.extend(["--incremental", "--follow-imports", "silent"])
+        args.extend(settings['args'])
         args = apply_overrides(args, overrides)
         log.info(f"mypy - {args=}")
         report, messages, status = mypy_api.run(args)
@@ -253,19 +243,28 @@ def pylsp_lint(
         # If daemon is dead/absent, kill will no-op.
         # In either case, reset to fresh state
 
-        _, messages, status = mypy_api.run_dmypy(["status"])
+        dmypy_args = [
+            "--status-file",
+            runtime_filepaths["dmypy_status_file"].as_posix(),
+        ]
+
+        _, messages, status = mypy_api.run_dmypy([*dmypy_args, "status"])
         if status != 0:
             log.info(f"dmypy status - {status=} ({messages=})")
             mypy_api.run_dmypy(["kill"])
 
         # run to use existing daemon or restart if required
-        dmypy_args = ["--status-file", runtime_filepaths["dmypy_status_file"].as_posix()]
         dmypy_subcommand_args = [
             "--perf-stats-file",
             runtime_filepaths["dmypy_perf_file"].as_posix(),
+            # "--log-file",
+            # runtime_filepaths["dmypy_logfile"].as_posix(),
+            # "--verbose",
         ]
 
-        args = [*dmypy_args, "run", *dmypy_subcommand_args, "--"] + apply_overrides(args, overrides)
+        args = [*dmypy_args, "run", *dmypy_subcommand_args, "--"] + apply_overrides(
+            args, overrides
+        )
 
         log.info(f"dmypy - running 'dmypy {' '.join(args)}'")
         report, messages, status = mypy_api.run_dmypy(args)
@@ -320,6 +319,7 @@ def pylsp_settings(config: Config) -> dict[str, dict[str, dict[str, str]]]:
 
     """
     configuration = init(config._root_path)
+    log.info(f"mypy - version '{__mypy_version__}'")
     return {"plugins": {"pylsp_mypy": configuration}}
 
 
@@ -351,7 +351,9 @@ def init(workspace: str) -> dict[str, str]:
             with open(path) as file:
                 configuration = ast.literal_eval(file.read())
 
-    mypy_config_file = find_config_file(workspace, ["mypy.ini", ".mypy.ini", "pyproject.toml"])
+    mypy_config_file = find_config_file(
+        workspace, ["mypy.ini", ".mypy.ini", "pyproject.toml"]
+    )
     mypy_config_file_map[workspace] = mypy_config_file
 
     log.info(f"mypy cfg - {mypy_config_file=} {configuration=}")
